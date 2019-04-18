@@ -14,15 +14,76 @@
 
 #define MAX_PID_LEN 10
 
+enum l_type {
+	FLOCK = 0,
+	FCNTL,
+	LOCKF
+};
+
+struct lock_request {
+	const char *filename;
+	int         fd;
+	enum l_type type;
+	int         no_block;
+	int         timeout;
+};
+
 int child = 0;
+
+int lock_descriptor(struct lock_request *req) {
+	int retval = 1;
+	
+	switch (req->type) {
+		case LOCKF:
+			errno = 0;
+			if (lockf(req->fd, (req->no_block) ? F_TLOCK : F_LOCK, 0) == -1) {
+				printf("Failed to lock file (fd = %i): %s\n", req->fd, strerror(errno));
+				retval = 0;
+			}
+			break;
+		case FLOCK:
+			if (flock(req->fd, (req->no_block) ? LOCK_EX | LOCK_NB : LOCK_EX) == -1) {
+				printf("Failed to lock file (fd = %i): %s\n", req->fd, strerror(errno));
+				retval = 0;
+			}
+			break;
+		case FCNTL:
+			break;
+	}
+	
+	return retval;
+}
+
+/*
+ * Function to unlock an open file descriptor
+ * The file descriptor will have been passed to us by the user.
+ #
+ * This function will only be used if the file lock operation
+ * was given a file descriptor by the user AND the lock type was
+ * flock.
+ */
+int unlock_descriptor(int fd) {
+	int retval = 1;
+	/*
+	 * Only need to handle flock lock type
+	 */
+	errno = 0;
+	if (flock(fd, LOCK_UN) == -1) {
+		printf("Failed to unlock file (fd = %i): %s\n", fd, strerror(errno));
+		retval = 0;
+	}
+	else {
+		printf("Unlocked file descriptor %i\n", fd);
+	}
+	return retval;
+}
 
 /*
  * Child process functions
  */
  
-int child_loop(const char *filename, int ppid, int script_pid, int no_block) {
-	int  fd,
-	     pid = getpid();
+int child_loop(struct lock_request *req, int ppid, int script_pid) {
+	int  pid = getpid();
 	char pid_str[MAX_PID_LEN+1] = {0};
 	
 	/*
@@ -35,8 +96,8 @@ int child_loop(const char *filename, int ppid, int script_pid, int no_block) {
 	 * Open file
 	 */
 	errno = 0;
-	if ((fd = open(filename, O_CREAT | O_RDWR, 0700)) < 0) {
-		printf("Failed to open file %s: %s\n", filename, strerror(errno));
+	if ((req->fd = open(req->filename, O_CREAT | O_RDWR, 0700)) < 0) {
+		printf("Failed to open file %s: %s\n", req->filename, strerror(errno));
 		kill(ppid, SIGUSR2);
 		return 1;
 	}
@@ -44,9 +105,8 @@ int child_loop(const char *filename, int ppid, int script_pid, int no_block) {
 	/*
 	 * Lock file
 	 */
-	errno = 0;
-	if (lockf(fd, (no_block) ? F_TLOCK : F_LOCK, 0) == -1) {
-		printf("Failed to lock file %s (%i): %s\n", filename, fd, strerror(errno));
+	printf("Locking file %s\n", req->filename);
+	if (!lock_descriptor(req)) {
 		kill(ppid, SIGUSR2);
 		return 1;
 	}
@@ -55,9 +115,9 @@ int child_loop(const char *filename, int ppid, int script_pid, int no_block) {
 	 * File is locked - write our PID to it
 	 */
 	snprintf(pid_str, MAX_PID_LEN, "%i", pid);
-	lseek(fd, 0, SEEK_SET);
-	ftruncate(fd, 0);
-	write(fd, pid_str, strlen(pid_str));
+	lseek(req->fd, 0, SEEK_SET);
+	ftruncate(req->fd, 0);
+	write(req->fd, pid_str, strlen(pid_str));
 	
 	/*
 	 * Now send a signal to tell the parent process we have locked the file
@@ -161,7 +221,7 @@ void sig_handler(int sig) {
 /*
  * Function to unlock the file
  */
-int unlock_file(const char *filename, int timeout, int no_block) {
+int unlock_file(struct lock_request *req) {
 	int   fd,
 	      locked,
 	      pid  = 0,
@@ -173,14 +233,14 @@ int unlock_file(const char *filename, int timeout, int no_block) {
 	 * Open the file and check that it is locked
 	 */
 	errno = 0;
-	if ((fd = open(filename, O_RDONLY)) < 0) {
-		printf("Failed to open file %s: %s\n", filename, strerror(errno));
+	if ((fd = open(req->filename, O_RDONLY)) < 0) {
+		printf("Failed to open file %s: %s\n", req->filename, strerror(errno));
 		return 1;
 	}
 	
 	errno = 0;
 	if ((locked = lockf(fd, F_TEST, 0)) == 0) {
-		printf("File %s was not locked\n", filename);
+		printf("File %s was not locked\n", req->filename);
 	}
 	
 	/*
@@ -192,12 +252,15 @@ int unlock_file(const char *filename, int timeout, int no_block) {
 			pid = 0;
 	}
 	if (pid == 0) {
-		printf("Failed to read pid from file %s\n", filename);
+		printf("Failed to read pid from file %s\n", req->filename);
 		return 1;
 	}
 	
-	timeout = timeout * 10;
-	while (time++ < timeout || timeout == 0) {
+	if (req->no_block)
+		req->timeout = 0;
+	
+	req->timeout = req->timeout * 10;
+	while (time++ < req->timeout || req->timeout == 0) {
 		errno = 0;
 		if (kill(pid, SIGUSR2) < 0) {
 			if (time == 1)
@@ -216,7 +279,7 @@ int unlock_file(const char *filename, int timeout, int no_block) {
 		usleep(1000+100);
 	}
 
-	if (time == timeout) {
+	if (time == req->timeout) {
 		printf("Timed out\n");
 		return 1;
 	}
@@ -225,17 +288,20 @@ int unlock_file(const char *filename, int timeout, int no_block) {
 	}
 }
 
+int lock_file(struct lock_request *req) {
+	return 1;
+}
+
 int main(int argc, char **argv) {
-	char *filename,
-	      opt,
-	     *end;
-	int   longopt_idx,
-	      timeout  = -1,
-	      no_block = 0,
-	      unlock   = 0;
-	pid_t pid,
-	      ppid,
-	      cpid;
+	char                opt,
+	                   *end;
+	int                 longopt_idx,
+	                    unlock  = 0,
+	                    do_fork = 1;
+	pid_t               pid,
+	                    ppid,
+	                    cpid;
+	struct lock_request req     = {0};
 	
 	/*
 	 * Get command line args
@@ -244,29 +310,43 @@ int main(int argc, char **argv) {
 		{"timeout",  required_argument, 0, 't'},
 		{"no-block", no_argument,       0, 'n'},
 		{"unlock",   no_argument,       0, 'u'},
+		{"type",     required_argument, 0, 'T'},
 		{0, 0, 0, 0}
 	};
 	
-	while ((opt = getopt_long(argc, argv, "t:nu", long_options, &longopt_idx)) != -1) {
+	while ((opt = getopt_long(argc, argv, "t:T:nu", long_options, &longopt_idx)) != -1) {
 		switch (opt) {
 			case 't':
-				timeout = (int)strtol(optarg, &end, 10);
-				if (*end != '\0' || timeout < 0) {
+				req.timeout = (int)strtol(optarg, &end, 10);
+				if (*end != '\0' || req.timeout < 0) {
 					printf("Timeout argument should be a positive integer\n");
 					return 1;
 				}
 				break;
 			
 			case 'n':
-				no_block = 1;
+				req.no_block = 1;
 				break;
 			
 			case 'u':
 				unlock = 1;
 				break;
 			
+			case 'T':
+				if (strcasecmp(optarg, "lockf") == 0)
+					req.type = LOCKF;
+				else if (strcasecmp(optarg, "flock") == 0)
+					req.type = FLOCK;
+				else if (strcasecmp(optarg, "fcntl") == 0)
+					req.type = FCNTL;
+				else {
+					printf("Invalid type: %s\n", optarg);
+					return 1;
+				}
+				break;
+			
 			default:
-				printf("Unrecognised option %c\n", opt);
+				printf("Unrecognised option: %c\n", opt);
 				return 1;
 		}
 	}
@@ -274,7 +354,7 @@ int main(int argc, char **argv) {
 	/*
 	 * no-block means return straight away - timeout doesn't make sense
 	 */
-	if (no_block && timeout >= 0) {
+	if (req.no_block && req.timeout >= 0) {
 		printf("Cannot set no-block and timeout together\n");
 		return 1;
 	}
@@ -282,14 +362,22 @@ int main(int argc, char **argv) {
 	/*
 	 * If timeout has not been changed, default to 0 (wait forever)
 	 */
-	if (timeout == -1)
-		timeout = 0;
+	if (req.timeout == -1)
+		req.timeout = 0;
 	
 	/*
 	 * Now get filename argument
 	 */
 	if (optind < argc) {
-		filename = argv[optind];
+		/*
+		 * Work out if we have a filename or a file descriptor
+		 */
+		end = NULL;
+		req.fd = (int)strtol(argv[optind], &end, 10);
+		if (*end != '\0') {
+			req.fd = 0;
+			req.filename = argv[optind];
+		}
 	}
 	else {
 		printf("No filename given\n");
@@ -303,39 +391,64 @@ int main(int argc, char **argv) {
 	/*
 	 * Handle the unlock if required
 	 */
-	if (unlock)
-		return unlock_file(filename, timeout, no_block);
+	if (unlock) {
+		if (req.fd)
+			return unlock_descriptor(req.fd);
+		else
+			return unlock_file(&req);
+	}
 	
 	/*
-	 * When the child locks the file, it sends us a USR1 signal to let us know.
-	 * If it fails for any reason it can send USR2 signal instead.
-	 * The parent can send USR1 to the child to kill it after a timeout.
-	 *
-	 * Set the signal handler now to avoid any race conditions after the fork.
+	 * Now decide if we need to fork a child process
+	 * We only do not need to fork if we have been given a file descriptor
+	 * and we have been told to use flock
 	 */
-	signal(SIGUSR1, sig_handler);
-	signal(SIGUSR2, sig_handler);
+	if (req.fd && req.type == FLOCK)
+		do_fork = 0;
 	
-	/*
-	 * 3 PIDs to be interested in:
-	 *  cpid : child process PID
-	 *   pid : parent process PID
-	 *  ppid : parent's parent PID
-	 */
-	pid  = getpid();
-	ppid = getppid();
-	cpid = fork();
-	
-	if (cpid == 0) {
+	if (do_fork) {
 		/*
-		 * Child process
+		 * When the child locks the file, it sends us a USR1 signal to let us know.
+		 * If it fails for any reason it can send USR2 signal instead.
+		 * The parent can send USR1 to the child to kill it after a timeout.
+		 *
+		 * Set the signal handler now to avoid any race conditions after the fork.
 		 */
-		return child_loop(filename, pid, ppid, no_block);
+		signal(SIGUSR1, sig_handler);
+		signal(SIGUSR2, sig_handler);
+		
+		/*
+		 * 3 PIDs to be interested in:
+		 *  cpid : child process PID
+		 *   pid : parent process PID
+		 *  ppid : parent's parent PID
+		 */
+		pid  = getpid();
+		ppid = getppid();
+		cpid = fork();
+		
+		if (cpid == 0) {
+			/*
+			 * Child process
+			 */
+			return child_loop(&req, pid, ppid);
+		}
+		else {
+			/*
+			 * Parent process just needs to hang around until
+			 * the child has done its locking
+			 */
+			return parent_loop(cpid, req.timeout);
+		}
 	}
 	else {
 		/*
-		 * Parent process
+		 * Lock file descriptor
 		 */
-		return parent_loop(cpid, timeout);
-	}	
+		printf("Locking file descriptor %i\n", req.fd);
+		if (!lock_descriptor(&req)) {
+			return 1;
+		}
+		return 0;
+	}
 }
